@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use animus_plugin_protocol::HealthStatus;
 use animus_provider_oai::backend::OaiBackend;
 use animus_provider_oai::config::OaiConfig;
-use animus_provider_protocol::{AgentRunRequest, ProviderBackend};
+use animus_provider_protocol::{AgentRunRequest, BackendError, ProviderBackend};
 use serde_json::json;
 
 fn run_request(model: Option<&str>, prompt: &str) -> AgentRunRequest {
@@ -150,4 +150,116 @@ async fn resume_agent_returns_unsupported() {
         msg.contains("not supported"),
         "error message did not mention 'not supported': {msg}"
     );
+}
+
+/// Regression: `OaiConfig::from_env()` must succeed even when
+/// `OPENAI_API_KEY` is unset so that credential-free plugin lifecycle
+/// calls (notably `--manifest` and `health`) can run in shells without
+/// secrets. The previous behavior aborted in `main()` before the runtime
+/// could honor `--manifest`, which made the plugin invisible to
+/// `animus plugin list` whenever the listing shell lacked credentials.
+#[test]
+fn from_env_succeeds_without_credentials() {
+    let _guard = EnvKeyGuard::clear();
+    let config = OaiConfig::from_env().expect("from_env must not require OPENAI_API_KEY");
+    assert!(
+        config.api_key.is_none(),
+        "api_key should be None when OPENAI_API_KEY is unset, got {:?}",
+        config.api_key
+    );
+}
+
+/// Regression: a credential-free backend must report itself as
+/// `Unhealthy` with a clear `last_error` instead of either panicking
+/// or making a doomed network request.
+#[tokio::test]
+async fn health_reports_unhealthy_when_credentials_missing() {
+    let backend = OaiBackend::new(OaiConfig {
+        api_key: None,
+        base_url: "http://127.0.0.1:1".to_string(),
+        org: None,
+        default_model: "gpt-5".to_string(),
+    });
+    let health = backend.health().await.expect("health should not error");
+    assert_eq!(health.status, HealthStatus::Unhealthy);
+    let last_error = health.last_error.expect("last_error should be set");
+    assert!(
+        last_error.contains("OPENAI_API_KEY"),
+        "last_error did not mention OPENAI_API_KEY: {last_error}"
+    );
+}
+
+/// Regression: when credentials are missing, `run_agent` must surface a
+/// clear `BackendError::Unavailable` *before* attempting any network
+/// call, so the host can advertise the plugin in `plugin list` and only
+/// fail at actual use sites.
+#[tokio::test]
+async fn run_agent_requires_credentials() {
+    let backend = OaiBackend::new(OaiConfig {
+        api_key: None,
+        base_url: "http://127.0.0.1:1".to_string(),
+        org: None,
+        default_model: "gpt-5".to_string(),
+    });
+    let err = backend
+        .run_agent(run_request(Some("gpt-5"), "hi"))
+        .await
+        .expect_err("run_agent should require OPENAI_API_KEY");
+    match err {
+        BackendError::Unavailable(msg) => assert!(
+            msg.contains("OPENAI_API_KEY"),
+            "Unavailable message did not mention OPENAI_API_KEY: {msg}"
+        ),
+        other => panic!("expected BackendError::Unavailable, got {other:?}"),
+    }
+}
+
+/// Regression: the binary entrypoint must print manifest JSON without
+/// requiring any environment variables. This invokes the real built
+/// binary so we exercise `main()` end-to-end, mirroring how the plugin
+/// host discovers plugins in `animus plugin list`.
+#[test]
+fn main_emits_manifest_without_credentials() {
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_animus-provider-oai"));
+    let output = std::process::Command::new(&binary)
+        .arg("--manifest")
+        .env_remove("OPENAI_API_KEY")
+        .output()
+        .expect("failed to spawn animus-provider-oai");
+    assert!(
+        output.status.success(),
+        "--manifest exited with {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf-8");
+    let manifest: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout should be JSON");
+    assert_eq!(manifest["name"], "animus-provider-oai");
+    assert_eq!(manifest["plugin_kind"], "provider");
+}
+
+/// Test helper: temporarily clear `OPENAI_API_KEY` and restore it on
+/// drop so tests touching env vars stay isolated.
+struct EnvKeyGuard {
+    previous: Option<String>,
+}
+
+impl EnvKeyGuard {
+    fn clear() -> Self {
+        let previous = std::env::var("OPENAI_API_KEY").ok();
+        // SAFETY: tests in this file are scoped, but env mutation is
+        // process-global. We only flip a single var and restore it.
+        std::env::remove_var("OPENAI_API_KEY");
+        Self { previous }
+    }
+}
+
+impl Drop for EnvKeyGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("OPENAI_API_KEY", value),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+    }
 }

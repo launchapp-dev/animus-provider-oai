@@ -9,6 +9,8 @@ pub enum OaiError {
     Http(#[from] reqwest::Error),
     #[error("openai api error ({status}): {message}")]
     Api { status: u16, message: String },
+    #[error("OPENAI_API_KEY is required for animus-provider-oai run/resume calls")]
+    MissingApiKey,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -83,7 +85,7 @@ pub struct ModelEntry {
 pub struct OaiClient {
     inner: reqwest::Client,
     base_url: String,
-    api_key: String,
+    api_key: Option<String>,
     org: Option<String>,
 }
 
@@ -101,13 +103,14 @@ impl OaiClient {
         }
     }
 
+    pub fn has_api_key(&self) -> bool {
+        self.api_key.as_deref().is_some_and(|key| !key.is_empty())
+    }
+
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, OaiError> {
+        let api_key = self.api_key.as_deref().ok_or(OaiError::MissingApiKey)?;
         let url = format!("{}/chat/completions", self.base_url);
-        let mut req = self
-            .inner
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(request);
+        let mut req = self.inner.post(&url).bearer_auth(api_key).json(request);
         if let Some(org) = &self.org {
             req = req.header("OpenAI-Organization", org);
         }
@@ -124,8 +127,9 @@ impl OaiClient {
     }
 
     pub async fn models(&self) -> Result<ModelsResponse, OaiError> {
+        let api_key = self.api_key.as_deref().ok_or(OaiError::MissingApiKey)?;
         let url = format!("{}/models", self.base_url);
-        let mut req = self.inner.get(&url).bearer_auth(&self.api_key);
+        let mut req = self.inner.get(&url).bearer_auth(api_key);
         if let Some(org) = &self.org {
             req = req.header("OpenAI-Organization", org);
         }

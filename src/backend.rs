@@ -8,7 +8,7 @@ use animus_provider_protocol::{
 use async_trait::async_trait;
 
 use crate::client::{ChatMessage, ChatRequest, OaiClient, OaiError};
-use crate::config::OaiConfig;
+use crate::config::{OaiConfig, MISSING_API_KEY_MESSAGE};
 
 pub struct OaiBackend {
     client: OaiClient,
@@ -83,6 +83,11 @@ impl ProviderBackend for OaiBackend {
     }
 
     async fn run_agent(&self, request: AgentRunRequest) -> Result<AgentRunResponse, BackendError> {
+        if !self.client.has_api_key() {
+            return Err(BackendError::Unavailable(
+                MISSING_API_KEY_MESSAGE.to_string(),
+            ));
+        }
         let started = Instant::now();
         let chat_request = self.build_chat_request(&request);
         let model_label = chat_request.model.clone();
@@ -103,6 +108,9 @@ impl ProviderBackend for OaiBackend {
                 }
                 OaiError::Http(error) => {
                     BackendError::RunFailed(format!("oai http error: {error}"))
+                }
+                OaiError::MissingApiKey => {
+                    BackendError::Unavailable(MISSING_API_KEY_MESSAGE.to_string())
                 }
             })?;
 
@@ -151,6 +159,11 @@ impl ProviderBackend for OaiBackend {
         &self,
         _request: AgentResumeRequest,
     ) -> Result<AgentRunResponse, BackendError> {
+        if !self.client.has_api_key() {
+            return Err(BackendError::Unavailable(
+                MISSING_API_KEY_MESSAGE.to_string(),
+            ));
+        }
         Err(BackendError::Other(anyhow::anyhow!(
             "oai: resume not supported (stateless HTTP API)"
         )))
@@ -163,6 +176,14 @@ impl ProviderBackend for OaiBackend {
     }
 
     async fn health(&self) -> Result<HealthCheckResult, BackendError> {
+        if !self.client.has_api_key() {
+            return Ok(HealthCheckResult {
+                status: HealthStatus::Unhealthy,
+                uptime_ms: None,
+                memory_usage_bytes: None,
+                last_error: Some(MISSING_API_KEY_MESSAGE.to_string()),
+            });
+        }
         match self.client.models().await {
             Ok(_) => Ok(HealthCheckResult {
                 status: HealthStatus::Healthy,
