@@ -1,0 +1,43 @@
+[package]
+name = "animus-provider-oai"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "OpenAI-compatible HTTP API provider plugin for Animus"
+repository = "https://github.com/launchapp-dev/animus-provider-oai"
+homepage = "https://github.com/launchapp-dev/animus-cli"
+readme = "README.md"
+default-run = "animus-provider-oai"
+
+[lib]
+name = "animus_provider_oai"
+path = "src/lib.rs"
+
+[[bin]]
+name = "animus-provider-oai"
+path = "src/main.rs"
+
+[dependencies]
+animus-plugin-protocol   = { git = "https://github.com/launchapp-dev/animus-protocol", branch = "main" }
+animus-provider-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", branch = "main" }
+animus-plugin-runtime    = { git = "https://github.com/launchapp-dev/animus-protocol", branch = "main" }
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "process", "sync"] }
+async-trait = "0.1"
+futures = "0.3"
+
+anyhow = "1"
+thiserror = "1"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+mockito = "1"
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
