@@ -2,12 +2,12 @@ use std::time::Instant;
 
 use animus_plugin_protocol::{HealthCheckResult, HealthStatus};
 use animus_provider_protocol::{
-    AgentResumeRequest, AgentRunRequest, AgentRunResponse, BackendError, ProviderBackend,
-    ProviderCapabilities, ProviderManifest, TokenUsage,
+    AgentNotification, AgentResumeRequest, AgentRunRequest, AgentRunResponse, BackendError,
+    NotificationSink, ProviderBackend, ProviderCapabilities, ProviderManifest, TokenUsage,
 };
 use async_trait::async_trait;
 
-use crate::client::{ChatMessage, ChatRequest, OaiClient, OaiError};
+use crate::client::{ChatMessage, ChatRequest, OaiClient, OaiError, StreamEvent};
 use crate::config::{OaiConfig, MISSING_API_KEY_MESSAGE};
 
 pub struct OaiBackend {
@@ -52,7 +52,25 @@ impl OaiBackend {
                     }
                 })
             }),
+            stream: None,
+            stream_options: None,
         }
+    }
+}
+
+fn map_oai_error(error: OaiError) -> BackendError {
+    match error {
+        OaiError::Api { status, message } if status == 401 || status == 403 => {
+            BackendError::Unavailable(format!("oai auth failed ({status}): {message}"))
+        }
+        OaiError::Api { status, message } if (500..600).contains(&status) => {
+            BackendError::Unavailable(format!("oai upstream {status}: {message}"))
+        }
+        OaiError::Api { status, message } => {
+            BackendError::RunFailed(format!("oai api {status}: {message}"))
+        }
+        OaiError::Http(error) => BackendError::RunFailed(format!("oai http error: {error}")),
+        OaiError::MissingApiKey => BackendError::Unavailable(MISSING_API_KEY_MESSAGE.to_string()),
     }
 }
 
@@ -73,7 +91,7 @@ impl ProviderBackend for OaiBackend {
             ],
             tool: "oai".to_string(),
             capabilities: ProviderCapabilities {
-                streaming: false,
+                streaming: true,
                 resume: false,
                 cancellation: false,
                 write_capable: false,
@@ -83,6 +101,15 @@ impl ProviderBackend for OaiBackend {
     }
 
     async fn run_agent(&self, request: AgentRunRequest) -> Result<AgentRunResponse, BackendError> {
+        self.run_agent_streaming(request, NotificationSink::noop())
+            .await
+    }
+
+    async fn run_agent_streaming(
+        &self,
+        request: AgentRunRequest,
+        sink: NotificationSink,
+    ) -> Result<AgentRunResponse, BackendError> {
         if !self.client.has_api_key() {
             return Err(BackendError::Unavailable(
                 MISSING_API_KEY_MESSAGE.to_string(),
@@ -92,62 +119,84 @@ impl ProviderBackend for OaiBackend {
         let chat_request = self.build_chat_request(&request);
         let model_label = chat_request.model.clone();
 
-        let response = self
+        let mut rx = self
             .client
-            .chat(&chat_request)
+            .chat_stream(&chat_request)
             .await
-            .map_err(|error| match error {
-                OaiError::Api { status, message } if status == 401 || status == 403 => {
-                    BackendError::Unavailable(format!("oai auth failed ({status}): {message}"))
-                }
-                OaiError::Api { status, message } if (500..600).contains(&status) => {
-                    BackendError::Unavailable(format!("oai upstream {status}: {message}"))
-                }
-                OaiError::Api { status, message } => {
-                    BackendError::RunFailed(format!("oai api {status}: {message}"))
-                }
-                OaiError::Http(error) => {
-                    BackendError::RunFailed(format!("oai http error: {error}"))
-                }
-                OaiError::MissingApiKey => {
-                    BackendError::Unavailable(MISSING_API_KEY_MESSAGE.to_string())
-                }
-            })?;
+            .map_err(map_oai_error)?;
 
-        let output = response
-            .choices
-            .iter()
-            .find_map(|choice| choice.message.content.clone())
-            .unwrap_or_default();
+        let mut output_text = String::new();
+        let mut errors: Vec<String> = Vec::new();
+        let mut session_id: Option<String> = None;
+        let mut response_model: Option<String> = None;
+        let mut tokens_used: Option<TokenUsage> = None;
+        let mut pending_session_id: Option<String> = None;
 
-        let session_id = if !response.id.is_empty() {
-            response.id.clone()
-        } else {
-            uuid::Uuid::new_v4().to_string()
-        };
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::Delta(text) => {
+                    if text.is_empty() {
+                        continue;
+                    }
+                    output_text.push_str(&text);
+                    sink.emit(AgentNotification::Output {
+                        session_id: session_id.clone().unwrap_or_default(),
+                        text,
+                        is_final: false,
+                    });
+                }
+                StreamEvent::Done {
+                    session_id: sid,
+                    model: m,
+                    usage,
+                } => {
+                    pending_session_id = sid;
+                    response_model = m;
+                    tokens_used = usage.map(|u| TokenUsage {
+                        input: u.prompt_tokens,
+                        output: u.completion_tokens,
+                        cached: None,
+                        cache_writes: None,
+                    });
+                }
+                StreamEvent::Error(message) => {
+                    sink.emit(AgentNotification::Error {
+                        session_id: session_id.clone().unwrap_or_default(),
+                        message: message.clone(),
+                        recoverable: true,
+                    });
+                    errors.push(message);
+                }
+            }
+        }
 
-        let tokens_used = response.usage.as_ref().map(|usage| TokenUsage {
-            input: usage.prompt_tokens,
-            output: usage.completion_tokens,
-            cached: None,
-            cache_writes: None,
+        if session_id.is_none() {
+            session_id = pending_session_id;
+        }
+        let session_id = session_id
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        sink.emit(AgentNotification::Output {
+            session_id: session_id.clone(),
+            text: output_text.clone(),
+            is_final: true,
         });
 
-        let backend_label = if response.model.is_empty() {
-            format!("oai:{model_label}")
-        } else {
-            format!("oai:{}", response.model)
+        let backend_label = match response_model {
+            Some(m) if !m.is_empty() => format!("oai:{m}"),
+            _ => format!("oai:{model_label}"),
         };
 
         Ok(AgentRunResponse {
             session_id,
             exit_code: 0,
-            output,
+            output: output_text,
             metadata: Vec::new(),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
             thinking: Vec::new(),
-            errors: Vec::new(),
+            errors,
             duration_ms: started.elapsed().as_millis() as u64,
             backend: backend_label,
             tokens_used,
@@ -157,7 +206,16 @@ impl ProviderBackend for OaiBackend {
 
     async fn resume_agent(
         &self,
+        request: AgentResumeRequest,
+    ) -> Result<AgentRunResponse, BackendError> {
+        self.resume_agent_streaming(request, NotificationSink::noop())
+            .await
+    }
+
+    async fn resume_agent_streaming(
+        &self,
         _request: AgentResumeRequest,
+        _sink: NotificationSink,
     ) -> Result<AgentRunResponse, BackendError> {
         if !self.client.has_api_key() {
             return Err(BackendError::Unavailable(

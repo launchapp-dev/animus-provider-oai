@@ -1,11 +1,11 @@
 schema = "animus.plugin.v1"
 name = "animus-provider-oai"
-version = "0.1.0"
+version = "0.2.0"
 plugin_kind = "provider"
 description = "OpenAI-compatible HTTP API provider plugin"
 
 [capabilities]
-streaming = false
+streaming = true
 progress = false
 cancellation = false
 
