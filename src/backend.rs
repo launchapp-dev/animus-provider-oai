@@ -131,6 +131,7 @@ impl ProviderBackend for OaiBackend {
         let mut response_model: Option<String> = None;
         let mut tokens_used: Option<TokenUsage> = None;
         let mut pending_session_id: Option<String> = None;
+        let mut tool_calls: Vec<serde_json::Value> = Vec::new();
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -144,6 +145,33 @@ impl ProviderBackend for OaiBackend {
                         text,
                         is_final: false,
                     });
+                }
+                StreamEvent::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    // OpenAI sends `function.arguments` as a JSON-encoded
+                    // string. Try to parse it back so downstream consumers
+                    // get structured args; fall back to a raw string blob
+                    // if the model emitted invalid JSON.
+                    let arguments_value: serde_json::Value = if arguments.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::from_str(&arguments)
+                            .unwrap_or_else(|_| serde_json::Value::String(arguments.clone()))
+                    };
+                    sink.emit(AgentNotification::ToolCall {
+                        session_id: session_id.clone().unwrap_or_default(),
+                        name: name.clone(),
+                        arguments: arguments_value.clone(),
+                        server: None,
+                    });
+                    tool_calls.push(serde_json::json!({
+                        "id": id,
+                        "name": name,
+                        "arguments": arguments_value,
+                    }));
                 }
                 StreamEvent::Done {
                     session_id: sid,
@@ -193,7 +221,7 @@ impl ProviderBackend for OaiBackend {
             exit_code: 0,
             output: output_text,
             metadata: Vec::new(),
-            tool_calls: Vec::new(),
+            tool_calls,
             tool_results: Vec::new(),
             thinking: Vec::new(),
             errors,

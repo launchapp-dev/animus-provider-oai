@@ -235,6 +235,151 @@ async fn run_agent_noop_sink_path_matches_streaming_response() {
 }
 
 #[tokio::test]
+async fn run_agent_streaming_emits_tool_call_with_accumulated_arguments() {
+    let mut server = mockito::Server::new_async().await;
+    // OpenAI streams a tool call across multiple deltas: the first delta
+    // carries `id` + `function.name`, subsequent deltas append chunks of
+    // `function.arguments`, and the run ends with `finish_reason:
+    // tool_calls`. The plugin should accumulate the fragments and emit a
+    // single `AgentNotification::ToolCall` with the parsed JSON arguments.
+    let body = sse_script(&[
+        json!({
+            "id": "chatcmpl-tools",
+            "model": "gpt-5",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_abc123",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "" }
+                    }]
+                }
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-tools",
+            "model": "gpt-5",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "arguments": "{\"city\":\"San " }
+                    }]
+                }
+            }]
+        }),
+        json!({
+            "id": "chatcmpl-tools",
+            "model": "gpt-5",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "arguments": "Francisco\",\"units\":\"c\"}" }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+    ]);
+    let _mock = server
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let recorder: Arc<Mutex<Vec<AgentNotification>>> = Arc::new(Mutex::new(Vec::new()));
+    let r2 = Arc::clone(&recorder);
+    let sink = NotificationSink::new(move |n| r2.lock().unwrap().push(n));
+
+    let backend = OaiBackend::new(OaiConfig::for_testing(server.url()));
+    let response = backend
+        .run_agent_streaming(run_request(Some("gpt-5"), "weather"), sink)
+        .await
+        .expect("streaming run should succeed");
+
+    let notifications = recorder.lock().unwrap().clone();
+    let tool_call = notifications
+        .iter()
+        .find_map(|n| match n {
+            AgentNotification::ToolCall {
+                name, arguments, ..
+            } => Some((name.clone(), arguments.clone())),
+            _ => None,
+        })
+        .expect("expected one ToolCall notification");
+    assert_eq!(tool_call.0, "get_weather");
+    assert_eq!(
+        tool_call.1,
+        json!({ "city": "San Francisco", "units": "c" }),
+        "accumulated arguments did not parse to expected JSON"
+    );
+
+    assert_eq!(response.tool_calls.len(), 1, "tool_calls in response");
+    let recorded = &response.tool_calls[0];
+    assert_eq!(recorded["id"], "call_abc123");
+    assert_eq!(recorded["name"], "get_weather");
+    assert_eq!(
+        recorded["arguments"],
+        json!({ "city": "San Francisco", "units": "c" })
+    );
+}
+
+#[tokio::test]
+async fn run_agent_streaming_handles_parallel_tool_calls() {
+    let mut server = mockito::Server::new_async().await;
+    let body = sse_script(&[json!({
+        "id": "chatcmpl-par",
+        "model": "gpt-5",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_a",
+                        "function": { "name": "one", "arguments": "{}" }
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_b",
+                        "function": { "name": "two", "arguments": "{\"x\":1}" }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })]);
+    let _mock = server
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let backend = OaiBackend::new(OaiConfig::for_testing(server.url()));
+    let response = backend
+        .run_agent(run_request(Some("gpt-5"), "parallel"))
+        .await
+        .expect("streaming run should succeed");
+
+    assert_eq!(response.tool_calls.len(), 2);
+    assert_eq!(response.tool_calls[0]["name"], "one");
+    assert_eq!(response.tool_calls[0]["id"], "call_a");
+    assert_eq!(response.tool_calls[1]["name"], "two");
+    assert_eq!(response.tool_calls[1]["id"], "call_b");
+    assert_eq!(response.tool_calls[1]["arguments"], json!({ "x": 1 }));
+}
+
+#[tokio::test]
 async fn run_agent_streaming_emits_error_notification_on_malformed_chunk() {
     let mut server = mockito::Server::new_async().await;
     let body = "data: not-valid-json\n\ndata: [DONE]\n\n".to_string();

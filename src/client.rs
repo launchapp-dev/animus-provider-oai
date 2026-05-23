@@ -42,6 +42,16 @@ pub struct ChatRequest {
 pub enum StreamEvent {
     /// Incremental text delta from the assistant message.
     Delta(String),
+    /// One tool invocation requested by the assistant. OpenAI streams
+    /// `delta.tool_calls[]` in fragments — `function.name` arrives once,
+    /// `function.arguments` chunks across multiple deltas — so the client
+    /// accumulates them and surfaces a single event per tool call once the
+    /// stream signals `finish_reason: tool_calls`.
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
     /// Final `[DONE]` sentinel followed by aggregated metadata. The client
     /// emits this after the SSE stream closes and carries the synthesized
     /// final transcript plus best-effort id / model / usage.
@@ -78,6 +88,33 @@ struct StreamChunkChoice {
 struct StreamChunkDelta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<StreamChunkToolCall>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChunkToolCall {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamChunkToolCallFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChunkToolCallFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+    arguments: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +265,7 @@ impl OaiClient {
             let mut session_id: Option<String> = None;
             let mut model: Option<String> = None;
             let mut usage: Option<ChatUsage> = None;
+            let mut pending_tool_calls: Vec<PendingToolCall> = Vec::new();
 
             while let Some(chunk) = stream.next().await {
                 match chunk {
@@ -277,7 +315,27 @@ impl OaiClient {
                                                     return;
                                                 }
                                             }
-                                            let _ = choice.finish_reason;
+                                            for tc in choice.delta.tool_calls {
+                                                accumulate_tool_call(&mut pending_tool_calls, tc);
+                                            }
+                                            if matches!(
+                                                choice.finish_reason.as_deref(),
+                                                Some("tool_calls")
+                                            ) {
+                                                for pending in pending_tool_calls.drain(..) {
+                                                    if tx
+                                                        .send(StreamEvent::ToolCall {
+                                                            id: pending.id,
+                                                            name: pending.name,
+                                                            arguments: pending.arguments,
+                                                        })
+                                                        .await
+                                                        .is_err()
+                                                    {
+                                                        return;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -297,6 +355,22 @@ impl OaiClient {
                             .await;
                         return;
                     }
+                }
+            }
+            // Stream closed without an explicit `[DONE]` — flush any
+            // accumulated tool_calls before signalling completion so callers
+            // don't lose tool-call deltas on truncated streams.
+            for pending in pending_tool_calls.drain(..) {
+                if tx
+                    .send(StreamEvent::ToolCall {
+                        id: pending.id,
+                        name: pending.name,
+                        arguments: pending.arguments,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
             }
             let _ = tx
@@ -328,6 +402,33 @@ impl OaiClient {
             });
         }
         Ok(response.json::<ModelsResponse>().await?)
+    }
+}
+
+// OpenAI streams tool_calls as fragmented deltas: the first delta carries
+// `id` + `function.name`, subsequent deltas append `function.arguments`
+// shards. We key by `index` (positional, stable per call) and accumulate
+// name + arguments across chunks until `finish_reason: tool_calls`.
+fn accumulate_tool_call(pending: &mut Vec<PendingToolCall>, fragment: StreamChunkToolCall) {
+    let idx = fragment.index as usize;
+    if pending.len() <= idx {
+        pending.resize_with(idx + 1, PendingToolCall::default);
+    }
+    let slot = &mut pending[idx];
+    if let Some(id) = fragment.id {
+        if !id.is_empty() {
+            slot.id = id;
+        }
+    }
+    if let Some(function) = fragment.function {
+        if let Some(name) = function.name {
+            if !name.is_empty() {
+                slot.name = name;
+            }
+        }
+        if let Some(arguments) = function.arguments {
+            slot.arguments.push_str(&arguments);
+        }
     }
 }
 
