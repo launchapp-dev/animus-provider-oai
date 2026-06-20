@@ -22,9 +22,14 @@ impl OaiBackend {
     }
 
     fn build_chat_request(&self, request: &AgentRunRequest) -> ChatRequest {
+        // Strip a leading `openrouter/` routing prefix. Animus uses that prefix to
+        // route a model to the oai-runner tool, but OpenRouter's API expects the
+        // bare `<vendor>/<model>` id (e.g. `minimax/minimax-m2.7`). No-op for ids
+        // that don't carry the prefix, so direct-OpenAI/other bases are unaffected.
         let model = request
             .model
             .clone()
+            .map(|m| m.strip_prefix("openrouter/").map(str::to_string).unwrap_or(m))
             .unwrap_or_else(|| self.config.default_model.clone());
         let mut messages = Vec::new();
         if let Some(system) = &request.system_prompt {

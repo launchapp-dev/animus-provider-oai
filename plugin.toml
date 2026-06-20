@@ -1,6 +1,6 @@
 schema = "animus.plugin.v1"
 name = "animus-provider-oai"
-version = "0.2.2"
+version = "0.2.3"
 plugin_kind = "provider"
 description = "OpenAI-compatible HTTP API provider plugin"
 
