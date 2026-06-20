@@ -53,6 +53,13 @@ impl OaiBackend {
                     "type": "json_schema",
                     "json_schema": {
                         "name": "animus_response",
+                        // strict: true makes OpenAI/OpenRouter ENFORCE the schema
+                        // (the model is constrained to emit valid, fully-populated
+                        // JSON matching it). Without strict the schema is only a
+                        // hint and weak models return a null/partial skeleton.
+                        // Requires strict-compatible schemas: additionalProperties
+                        // false, all properties required, no minLength/format.
+                        "strict": true,
                         "schema": schema,
                     }
                 })

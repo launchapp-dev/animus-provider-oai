@@ -1,6 +1,6 @@
 [package]
 name = "animus-provider-oai"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT"
 description = "OpenAI-compatible HTTP API provider plugin for Animus"
