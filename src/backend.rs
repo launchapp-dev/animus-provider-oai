@@ -9,6 +9,11 @@ use async_trait::async_trait;
 
 use crate::client::{ChatMessage, ChatRequest, OaiClient, OaiError, StreamEvent};
 use crate::config::{OaiConfig, MISSING_API_KEY_MESSAGE};
+use crate::gating::{self, GateContext};
+
+/// Default human-escalation timeout (seconds) for the approve-hook when the
+/// request carries no explicit `timeout_secs`. Matches the ACP provider.
+const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 300;
 
 pub struct OaiBackend {
     client: OaiClient,
@@ -74,6 +79,77 @@ fn map_oai_error(error: OaiError) -> BackendError {
     }
 }
 
+/// Build the approval gate context from an `AgentRunRequest`.
+///
+/// Adapted to this provider protocol where `runtime_contract` is a SEPARATE
+/// field (not nested inside `extras`, unlike the ACP `SessionRequest`).
+fn build_gate_context(request: &AgentRunRequest) -> GateContext {
+    let approvals_enabled = approvals_enabled(request);
+    let agent_id = resolve_agent_id(request).unwrap_or_else(|| "default".to_string());
+    let project_root = request
+        .project_root
+        .clone()
+        .unwrap_or_else(|| request.cwd.clone());
+    let animus_bin = std::env::var("ANIMUS_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "animus".to_string());
+    let timeout_secs = request
+        .timeout_secs
+        .unwrap_or(DEFAULT_APPROVAL_TIMEOUT_SECS);
+
+    GateContext {
+        approvals_enabled,
+        agent_id,
+        project_root,
+        animus_bin,
+        timeout_secs,
+    }
+}
+
+/// Whether the run opted into human-in-the-loop approvals.
+///
+/// Fails SAFE: this can only turn gating ON, never off. Approvals are enabled
+/// when EITHER:
+/// - top-level `extras.approvals == true`, or
+/// - the kernel pinned an approval identity at `runtime_contract.mcp.agent_id`.
+fn approvals_enabled(request: &AgentRunRequest) -> bool {
+    if request
+        .extras
+        .get("approvals")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    request
+        .runtime_contract
+        .as_ref()
+        .and_then(|rc| rc.pointer("/mcp/agent_id"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Resolve the agent profile id from `runtime_contract.mcp.agent_id`, falling
+/// back to a top-level `extras.agent_id`.
+fn resolve_agent_id(request: &AgentRunRequest) -> Option<String> {
+    if let Some(id) = request
+        .runtime_contract
+        .as_ref()
+        .and_then(|rc| rc.pointer("/mcp/agent_id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(id.to_string());
+    }
+    request
+        .extras
+        .get("agent_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(ToString::to_string)
+}
+
 #[async_trait]
 impl ProviderBackend for OaiBackend {
     fn manifest(&self) -> ProviderManifest {
@@ -115,6 +191,7 @@ impl ProviderBackend for OaiBackend {
                 MISSING_API_KEY_MESSAGE.to_string(),
             ));
         }
+        let gate_ctx = build_gate_context(&request);
         let started = Instant::now();
         let chat_request = self.build_chat_request(&request);
         let model_label = chat_request.model.clone();
@@ -132,6 +209,7 @@ impl ProviderBackend for OaiBackend {
         let mut tokens_used: Option<TokenUsage> = None;
         let mut pending_session_id: Option<String> = None;
         let mut tool_calls: Vec<serde_json::Value> = Vec::new();
+        let mut tool_results: Vec<serde_json::Value> = Vec::new();
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -161,17 +239,46 @@ impl ProviderBackend for OaiBackend {
                         serde_json::from_str(&arguments)
                             .unwrap_or_else(|_| serde_json::Value::String(arguments.clone()))
                     };
-                    sink.emit(AgentNotification::ToolCall {
-                        session_id: session_id.clone().unwrap_or_default(),
-                        name: name.clone(),
-                        arguments: arguments_value.clone(),
-                        server: None,
-                    });
-                    tool_calls.push(serde_json::json!({
-                        "id": id,
-                        "name": name,
-                        "arguments": arguments_value,
-                    }));
+                    // Approval gate: route the call through the Animus
+                    // approve-hook before recording it. Pass-through when
+                    // approvals are disabled; fails CLOSED on any error. An
+                    // `allow` may carry an edited input we MUST honor instead of
+                    // the original arguments.
+                    match gating::gate_tool_call(&gate_ctx, &name, &arguments_value).await {
+                        gating::GateOutcome::Allow {
+                            input: approved_input,
+                        } => {
+                            sink.emit(AgentNotification::ToolCall {
+                                session_id: session_id.clone().unwrap_or_default(),
+                                name: name.clone(),
+                                arguments: approved_input.clone(),
+                                server: None,
+                            });
+                            tool_calls.push(serde_json::json!({
+                                "id": id,
+                                "name": name,
+                                "arguments": approved_input,
+                            }));
+                        }
+                        gating::GateOutcome::Deny => {
+                            // Denied: do NOT emit the call or record it. Surface
+                            // a tool error to the model and a visible run error.
+                            tool_results.push(serde_json::json!({
+                                "id": id,
+                                "name": name,
+                                "status": "denied",
+                                "error": "denied by approval policy",
+                            }));
+                            let denial_message =
+                                format!("tool call `{name}` denied by approval policy");
+                            sink.emit(AgentNotification::Error {
+                                session_id: session_id.clone().unwrap_or_default(),
+                                message: denial_message.clone(),
+                                recoverable: true,
+                            });
+                            errors.push(denial_message);
+                        }
+                    }
                 }
                 StreamEvent::Done {
                     session_id: sid,
@@ -222,7 +329,7 @@ impl ProviderBackend for OaiBackend {
             output: output_text,
             metadata: Vec::new(),
             tool_calls,
-            tool_results: Vec::new(),
+            tool_results,
             thinking: Vec::new(),
             errors,
             duration_ms: started.elapsed().as_millis() as u64,
@@ -284,5 +391,95 @@ impl ProviderBackend for OaiBackend {
                 last_error: Some(error.to_string()),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn minimal_request() -> AgentRunRequest {
+        AgentRunRequest {
+            session_id: None,
+            prompt: "do a thing".to_string(),
+            model: None,
+            system_prompt: None,
+            cwd: PathBuf::from("/tmp"),
+            project_root: None,
+            permission_mode: None,
+            timeout_secs: None,
+            env: HashMap::new(),
+            mcp_servers: None,
+            tools: None,
+            response_schema: None,
+            runtime_contract: None,
+            extras: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn approvals_enabled_via_runtime_contract_agent_id() {
+        let mut req = minimal_request();
+        req.runtime_contract = Some(serde_json::json!({ "mcp": { "agent_id": "swe" } }));
+        let ctx = build_gate_context(&req);
+        assert!(ctx.approvals_enabled);
+        assert_eq!(ctx.agent_id, "swe");
+    }
+
+    #[test]
+    fn approvals_enabled_via_extras_flag() {
+        let mut req = minimal_request();
+        req.extras
+            .insert("approvals".to_string(), serde_json::json!(true));
+        let ctx = build_gate_context(&req);
+        assert!(ctx.approvals_enabled);
+        // No pinned agent id → falls back to "default".
+        assert_eq!(ctx.agent_id, "default");
+    }
+
+    #[test]
+    fn agent_id_falls_back_to_extras() {
+        let mut req = minimal_request();
+        req.extras
+            .insert("approvals".to_string(), serde_json::json!(true));
+        req.extras
+            .insert("agent_id".to_string(), serde_json::json!("reviewer"));
+        let ctx = build_gate_context(&req);
+        assert!(ctx.approvals_enabled);
+        assert_eq!(ctx.agent_id, "reviewer");
+    }
+
+    #[test]
+    fn runtime_contract_agent_id_wins_over_extras() {
+        let mut req = minimal_request();
+        req.runtime_contract = Some(serde_json::json!({ "mcp": { "agent_id": "swe" } }));
+        req.extras
+            .insert("agent_id".to_string(), serde_json::json!("reviewer"));
+        let ctx = build_gate_context(&req);
+        assert_eq!(ctx.agent_id, "swe");
+    }
+
+    #[test]
+    fn approvals_disabled_when_neither_present() {
+        let req = minimal_request();
+        let ctx = build_gate_context(&req);
+        assert!(!ctx.approvals_enabled);
+        assert_eq!(ctx.agent_id, "default");
+    }
+
+    #[test]
+    fn project_root_falls_back_to_cwd() {
+        let req = minimal_request();
+        let ctx = build_gate_context(&req);
+        assert_eq!(ctx.project_root, PathBuf::from("/tmp"));
+    }
+
+    #[test]
+    fn default_timeout_applied_when_unset() {
+        let req = minimal_request();
+        let ctx = build_gate_context(&req);
+        assert_eq!(ctx.timeout_secs, DEFAULT_APPROVAL_TIMEOUT_SECS);
     }
 }
