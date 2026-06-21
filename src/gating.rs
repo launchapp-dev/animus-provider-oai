@@ -9,9 +9,10 @@
 //! model via `tool_results`.
 //!
 //! Design invariants:
-//! - Gating only runs when approvals are enabled (`extras.approvals == true` or
-//!   a pinned `runtime_contract.mcp.agent_id`). Otherwise we pass through and
-//!   never spawn the binary.
+//! - Gating only runs when approvals are enabled (ONLY when
+//!   `extras.approvals == true`). The `runtime_contract.mcp.agent_id` pin is
+//!   for scoping, not a gate trigger. Otherwise we pass through and never spawn
+//!   the binary.
 //! - A verdict of `allow` allows the tool call, honoring any `updated_input`
 //!   the hook returned (a human/policy edit MUST be executed, not the original).
 //! - A verdict of `deny` blocks it.

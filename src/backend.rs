@@ -109,25 +109,24 @@ fn build_gate_context(request: &AgentRunRequest) -> GateContext {
 
 /// Whether the run opted into human-in-the-loop approvals.
 ///
-/// Fails SAFE: this can only turn gating ON, never off. Approvals are enabled
-/// when EITHER:
-/// - top-level `extras.approvals == true`, or
-/// - the kernel pinned an approval identity at `runtime_contract.mcp.agent_id`.
+/// Gating is enabled ONLY by the precise `extras.approvals == true` signal,
+/// which the runner sets exclusively when the phase agent has an
+/// `approval_policy`. The kernel forwards this top-level `approvals` param into
+/// `SessionRequest.extras`: the plugin host's `build_run_params` adds it to the
+/// RPC `extras` (ao-cli e42075e6) and `animus-plugin-runtime`'s
+/// `#[serde(flatten)] extras` catch-all carries it through `build_session_request`
+/// (animus-protocol f6ce11f), so `extras.approvals` reliably reaches this plugin.
+///
+/// The `runtime_contract.mcp.agent_id` pin is NOT a gate trigger: the runner
+/// pins it on every phase for MCP scoping (and the approve-hook `--agent-id`
+/// arg), so treating it as a gate would escalate and hang phases that have no
+/// approval_policy. See `resolve_agent_id` for how the pin is consumed.
 fn approvals_enabled(request: &AgentRunRequest) -> bool {
-    if request
+    request
         .extras
         .get("approvals")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
-    {
-        return true;
-    }
-    request
-        .runtime_contract
-        .as_ref()
-        .and_then(|rc| rc.pointer("/mcp/agent_id"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|s| !s.trim().is_empty())
 }
 
 /// Resolve the agent profile id from `runtime_contract.mcp.agent_id`, falling
@@ -420,11 +419,13 @@ mod tests {
     }
 
     #[test]
-    fn approvals_enabled_via_runtime_contract_agent_id() {
+    fn approvals_disabled_when_only_agent_id_pinned() {
         let mut req = minimal_request();
         req.runtime_contract = Some(serde_json::json!({ "mcp": { "agent_id": "swe" } }));
         let ctx = build_gate_context(&req);
-        assert!(ctx.approvals_enabled);
+        // A pinned agent_id is for scoping, not a gate trigger.
+        assert!(!ctx.approvals_enabled);
+        // agent_id still resolves for scoping even when the gate is off.
         assert_eq!(ctx.agent_id, "swe");
     }
 
@@ -455,6 +456,8 @@ mod tests {
     fn runtime_contract_agent_id_wins_over_extras() {
         let mut req = minimal_request();
         req.runtime_contract = Some(serde_json::json!({ "mcp": { "agent_id": "swe" } }));
+        req.extras
+            .insert("approvals".to_string(), serde_json::json!(true));
         req.extras
             .insert("agent_id".to_string(), serde_json::json!("reviewer"));
         let ctx = build_gate_context(&req);
